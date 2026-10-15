@@ -1,0 +1,64 @@
+cd /home/rushi/SSS/smart-solar-system
+
+cat > .gitignore <<'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Large raw datasets
+data/raw/
+
+# Generated Spark output and checkpoints
+data/processed/
+checkpoints/
+spark-warehouse/
+metastore_db/
+
+# Logs and temporary files
+*.log
+logs/
+tmp/
+temp/
+
+# Python caches and test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Ignore model artifacts by default, but include the trained forecast model
+models/*.pkl
+models/*.joblib
+!models/solar_forecast_model.pkl
+
+# Local database files
+*.db
+*.sqlite
+*.sqlite3
+EOF

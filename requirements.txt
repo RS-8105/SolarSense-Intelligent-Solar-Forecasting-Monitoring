@@ -1,0 +1,11 @@
+# Project dependencies for IoT-Based Smart Solar Power System
+# Dashboard and Forecasting
+streamlit>=1.66.0
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.6.0
+joblib>=1.3.0
+
+# Streaming and Ingestion
+kafka-python>=2.0.0
+pyspark>=3.5.0
