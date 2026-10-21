@@ -11,8 +11,7 @@ import streamlit as st
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data" / "processed" / "solar_readings"
-
+DATA_DIR = PROJECT_ROOT / "data" / "processed" / "solar_readings_live"
 REFRESH_SECONDS = 10
 
 st.set_page_config(
@@ -45,11 +44,37 @@ st.markdown(
 )
 
 # ============================================================
-# DATA LOADING
+# DATA FILE SIGNATURE
+# Detect newly created or modified Spark output files.
 # ============================================================
 
-@st.cache_data(ttl=REFRESH_SECONDS)
-def load_data():
+def get_file_signature():
+    if not DATA_DIR.exists():
+        return ()
+
+    signature = []
+
+    for file in DATA_DIR.glob("*.json"):
+        try:
+            stat = file.stat()
+            signature.append(
+                (file.name, stat.st_mtime_ns, stat.st_size)
+            )
+        except OSError:
+            continue
+
+    return tuple(sorted(signature))
+
+
+# ============================================================
+# LOAD SPARK OUTPUT
+# ============================================================
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def load_data(file_signature):
+    # The signature is used as part of the cache key.
+    del file_signature
+
     if not DATA_DIR.exists():
         return pd.DataFrame()
 
@@ -65,9 +90,14 @@ def load_data():
                         continue
 
                     try:
-                        records.append(json.loads(line))
+                        record = json.loads(line)
+
+                        if isinstance(record, dict):
+                            records.append(record)
+
                     except json.JSONDecodeError:
                         continue
+
         except OSError:
             continue
 
@@ -83,6 +113,12 @@ def load_data():
         df["DATE_TIME"],
         errors="coerce",
     )
+
+    if "INGESTION_TIME" in df.columns:
+        df["INGESTION_TIME"] = pd.to_datetime(
+            df["INGESTION_TIME"],
+            errors="coerce",
+        )
 
     df = df.dropna(subset=["DATE_TIME"])
 
@@ -122,7 +158,7 @@ def load_data():
         else:
             df[column] = False
 
-    # Collapse duplicate copies of identical measurements.
+    # Remove duplicate copies of identical measurements.
     identity_columns = [
         column
         for column in [
@@ -136,13 +172,28 @@ def load_data():
         if column in df.columns
     ]
 
-    df = df.drop_duplicates(
-        subset=identity_columns,
-        keep="last",
+    if identity_columns:
+        # Keep the copy with the latest ingestion timestamp.
+        if (
+            "INGESTION_TIME" in df.columns
+            and df["INGESTION_TIME"].notna().any()
+        ):
+            df = df.sort_values("INGESTION_TIME")
+
+        df = df.drop_duplicates(
+            subset=identity_columns,
+            keep="last",
+        )
+
+    sort_column = (
+        "INGESTION_TIME"
+        if "INGESTION_TIME" in df.columns
+        and df["INGESTION_TIME"].notna().any()
+        else "DATE_TIME"
     )
 
     return (
-        df.sort_values("DATE_TIME")
+        df.sort_values(sort_column)
         .reset_index(drop=True)
     )
 
@@ -152,407 +203,317 @@ def load_data():
 # ============================================================
 
 st.sidebar.title("☀️ Smart Solar")
-st.sidebar.caption("Generation monitoring and anomaly analysis")
+st.sidebar.caption(
+    "Generation monitoring and anomaly analysis"
+)
 st.sidebar.divider()
 
-if st.sidebar.button("Refresh data now", use_container_width=True):
+if st.sidebar.button(
+    "Refresh data now",
+    use_container_width=True,
+):
     st.cache_data.clear()
     st.rerun()
 
 st.sidebar.caption("Source: Spark processed JSON files")
-st.sidebar.caption(f"Automatic refresh: every {REFRESH_SECONDS} seconds")
-
-# ============================================================
-# AUTOMATIC REFRESH
-# ============================================================
-
-# Streamlit reruns the app periodically. The cache TTL ensures
-# that the JSON files are reread instead of serving stale data.
-@st.fragment(run_every=REFRESH_SECONDS)
-def refresh_status():
-    st.sidebar.caption(
-        f"Last refresh check: {time.strftime('%H:%M:%S')}"
-    )
-
-
-refresh_status()
-
-# ============================================================
-# LOAD AND SELECT DATA
-# ============================================================
-
-df = load_data()
-
-st.title("Smart Solar Analytics Dashboard")
-st.write(
-    "Monitor solar generation, environmental conditions, "
-    "and potential low-generation anomalies."
+st.sidebar.caption(
+    f"Automatic refresh: every {REFRESH_SECONDS} seconds"
 )
 
-if df.empty:
-    st.warning(
-        "No processed readings found. Start Kafka and Spark, "
-        "then send readings to the solar-generation topic."
-    )
-    st.code("data/processed/solar_readings/")
-    st.stop()
-
-st.sidebar.subheader("Data View")
-
-view_mode = st.sidebar.radio(
+record_view = st.sidebar.radio(
     "Choose records",
     [
         "Historical dataset",
         "Test and recent readings",
         "All readings",
     ],
-)
-
-# Temporary separation: the supplied historical dataset uses 2020.
-if view_mode == "Historical dataset":
-    display_df = df[df["DATE_TIME"].dt.year == 2020].copy()
-elif view_mode == "Test and recent readings":
-    display_df = df[df["DATE_TIME"].dt.year != 2020].copy()
-else:
-    display_df = df.copy()
-
-if display_df.empty:
-    st.info("No readings are available for the selected view.")
-    st.stop()
-
-display_df = (
-    display_df.sort_values("DATE_TIME")
-    .reset_index(drop=True)
-)
-
-latest = display_df.iloc[-1]
-
-# ============================================================
-# ANOMALY COUNTS
-# ============================================================
-
-low_flags = int(display_df["LOW_GENERATION_ANOMALY"].sum())
-zero_flags = int(display_df["ZERO_GENERATION_ANOMALY"].sum())
-quality_flags = int(display_df["DATA_QUALITY_ISSUE"].sum())
-
-# ============================================================
-# SYSTEM OVERVIEW
-# ============================================================
-
-st.subheader("System Overview")
-
-c1, c2, c3, c4 = st.columns(4)
-
-latest_ac = latest.get("AC_POWER")
-latest_irradiation = latest.get("IRRADIATION")
-
-c1.metric(
-    "Latest AC Power",
-    f"{latest_ac:,.2f}" if pd.notna(latest_ac) else "N/A",
-)
-
-c2.metric(
-    "Latest Irradiation",
-    f"{latest_irradiation:.3f}"
-    if pd.notna(latest_irradiation) else "N/A",
-)
-
-c3.metric("Low-Generation Flags", low_flags)
-c4.metric("Data Quality Issues", quality_flags)
-
-st.caption(
-    f"Distinct readings: {len(display_df):,} · "
-    f"Zero-generation flags: {zero_flags:,} · "
-    f"Latest timestamp: {latest['DATE_TIME']}"
+    index=0,
 )
 
 # ============================================================
-# GENERATION SUMMARY
+# DASHBOARD CONTENT
+# The fragment refreshes the analytics section automatically.
 # ============================================================
 
-st.divider()
-st.subheader("Generation Summary")
+@st.fragment(run_every=REFRESH_SECONDS)
+def render_dashboard(record_view):
+    signature = get_file_signature()
+    df = load_data(signature)
 
-power_values = (
-    display_df["AC_POWER"].dropna()
-    if "AC_POWER" in display_df.columns
-    else pd.Series(dtype=float)
-)
+    st.title("Smart Solar Analytics Dashboard")
 
-g1, g2, g3 = st.columns(3)
-
-if not power_values.empty:
-    g1.metric("Average AC Power", f"{power_values.mean():,.2f}")
-    g2.metric("Maximum AC Power", f"{power_values.max():,.2f}")
-    g3.metric("Minimum AC Power", f"{power_values.min():,.2f}")
-else:
-    g1.metric("Average AC Power", "N/A")
-    g2.metric("Maximum AC Power", "N/A")
-    g3.metric("Minimum AC Power", "N/A")
-
-st.caption(
-    "Statistics describe power readings in the dataset's units; "
-    "they are not energy totals."
-)
-
-# ============================================================
-# ENVIRONMENTAL CONDITIONS
-# ============================================================
-
-st.divider()
-st.subheader("Environmental Conditions")
-
-left, right = st.columns(2)
-
-with left:
-    st.markdown("**Irradiation over time**")
-
-    if "IRRADIATION" in display_df.columns:
-        irradiation_data = (
-            display_df[["DATE_TIME", "IRRADIATION"]]
-            .dropna()
-            .set_index("DATE_TIME")
-        )
-
-        if not irradiation_data.empty:
-            st.line_chart(irradiation_data)
-        else:
-            st.info("No irradiation data available.")
-
-with right:
-    st.markdown("**Temperature over time**")
-
-    temperature_columns = [
-        column for column in [
-            "AMBIENT_TEMPERATURE",
-            "MODULE_TEMPERATURE",
-        ]
-        if column in display_df.columns
-    ]
-
-    if temperature_columns:
-        temperature_data = (
-            display_df[["DATE_TIME"] + temperature_columns]
-            .dropna(subset=["DATE_TIME"])
-            .set_index("DATE_TIME")
-        )
-
-        if not temperature_data.empty:
-            st.line_chart(temperature_data)
-        else:
-            st.info("No temperature data available.")
-
-# ============================================================
-# SOLAR GENERATION AND DATE FILTER
-# ============================================================
-
-st.divider()
-st.subheader("Solar Generation")
-
-valid_dates = display_df["DATE_TIME"].dropna()
-
-if not valid_dates.empty:
-    min_date = valid_dates.min().date()
-    max_date = valid_dates.max().date()
-
-    selected_dates = st.date_input(
-        "Filter generation by date",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date,
-        key="generation_date_filter",
+    st.write(
+        "Monitor solar generation, environmental conditions, "
+        "and potential low-generation anomalies."
     )
 
-    if isinstance(selected_dates, (tuple, list)):
-        if len(selected_dates) == 2:
-            start_date, end_date = selected_dates
-        elif len(selected_dates) == 1:
-            start_date = end_date = selected_dates[0]
-        else:
-            start_date, end_date = min_date, max_date
-    else:
-        start_date = end_date = selected_dates
+    st.caption(
+        f"Last dashboard update: {time.strftime('%H:%M:%S')}"
+    )
 
-    chart_df = display_df[
-        display_df["DATE_TIME"].dt.date.between(
-            start_date,
-            end_date,
+    if df.empty:
+        st.warning(
+            "No processed readings found. Check whether Spark "
+            "is writing JSON files to "
+            "data/processed/solar_readings_live/."
         )
-    ].copy()
+        return
+
+    # --------------------------------------------------------
+    # SELECT DATASET
+    # --------------------------------------------------------
+
+    if record_view == "Historical dataset":
+        selected = df[
+            df["DATE_TIME"].dt.year == 2020
+        ].copy()
+
+    elif record_view == "Test and recent readings":
+        # Use Spark ingestion time rather than the historical
+        # solar event time to identify recently processed data.
+        if (
+            "INGESTION_TIME" in df.columns
+            and df["INGESTION_TIME"].notna().any()
+        ):
+            latest_ingestion = df["INGESTION_TIME"].max()
+            cutoff = latest_ingestion - pd.Timedelta(minutes=5)
+
+            selected = df[
+                df["INGESTION_TIME"] >= cutoff
+            ].copy()
+        else:
+            selected = df.iloc[0:0].copy()
+
+    else:
+        selected = df.copy()
+
+    sort_column = (
+        "INGESTION_TIME"
+        if "INGESTION_TIME" in selected.columns
+        and selected["INGESTION_TIME"].notna().any()
+        else "DATE_TIME"
+    )
+
+    selected = selected.sort_values(sort_column)
+
+    if selected.empty:
+        st.warning(
+            f"No readings available for '{record_view}'. "
+            "Try selecting All readings. For recent readings, "
+            "check that the producer and Spark are running."
+        )
+        return
+
+    # --------------------------------------------------------
+    # SYSTEM OVERVIEW
+    # --------------------------------------------------------
+
+    latest = selected.iloc[-1]
+
+    st.subheader("System Overview")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "Latest AC Power",
+        f"{latest.get('AC_POWER', 0):,.2f}",
+    )
+
+    col2.metric(
+        "Latest Irradiation",
+        f"{latest.get('IRRADIATION', 0):.3f}",
+    )
+
+    col3.metric(
+        "Low-Generation Flags",
+        int(selected["LOW_GENERATION_ANOMALY"].sum()),
+    )
+
+    col4.metric(
+        "Data Quality Issues",
+        int(selected["DATA_QUALITY_ISSUE"].sum()),
+    )
+
+    st.caption(
+        f"Distinct readings: {len(selected):,} · "
+        f"Zero-generation flags: "
+        f"{int(selected['ZERO_GENERATION_ANOMALY'].sum()):,} · "
+        f"Solar event time: {latest['DATE_TIME']} · "
+        f"Spark ingestion time: "
+        f"{latest.get('INGESTION_TIME', 'Unavailable')}"
+    )
+
+    st.divider()
+
+    # --------------------------------------------------------
+    # GENERATION SUMMARY
+    # --------------------------------------------------------
+
+    st.subheader("Generation Summary")
+
+    col1, col2, col3 = st.columns(3)
+
+    ac_power = selected["AC_POWER"].dropna()
+
+    if not ac_power.empty:
+        col1.metric(
+            "Average AC Power",
+            f"{ac_power.mean():,.2f}",
+        )
+        col2.metric(
+            "Maximum AC Power",
+            f"{ac_power.max():,.2f}",
+        )
+        col3.metric(
+            "Minimum AC Power",
+            f"{ac_power.min():,.2f}",
+        )
+    else:
+        col1.metric("Average AC Power", "N/A")
+        col2.metric("Maximum AC Power", "N/A")
+        col3.metric("Minimum AC Power", "N/A")
+
+    st.caption(
+        "Power statistics use the dataset's original units; "
+        "they are not energy totals."
+    )
+
+    st.divider()
+
+    # --------------------------------------------------------
+    # ENVIRONMENTAL CONDITIONS
+    # --------------------------------------------------------
+
+    st.subheader("Environmental Conditions")
+
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("**Irradiation over time**")
+
+        irradiation = selected.set_index("DATE_TIME")[
+            ["IRRADIATION"]
+        ].dropna()
+
+        st.line_chart(irradiation, height=300)
+
+    with right:
+        st.markdown("**Temperature over time**")
+
+        temperature_columns = [
+            column
+            for column in [
+                "AMBIENT_TEMPERATURE",
+                "MODULE_TEMPERATURE",
+            ]
+            if column in selected.columns
+        ]
+
+        if temperature_columns:
+            temperatures = selected.set_index("DATE_TIME")[
+                temperature_columns
+            ].dropna(how="all")
+
+            st.line_chart(temperatures, height=300)
+
+    st.divider()
+
+    # --------------------------------------------------------
+    # POWER GENERATION TREND
+    # --------------------------------------------------------
+
+    st.subheader("Solar Power Generation")
 
     power_columns = [
-        column for column in ["AC_POWER", "DC_POWER"]
-        if column in chart_df.columns
+        column
+        for column in ["AC_POWER", "DC_POWER"]
+        if column in selected.columns
     ]
 
-    if not chart_df.empty and power_columns:
-        power_data = (
-            chart_df[["DATE_TIME"] + power_columns]
-            .dropna(subset=["DATE_TIME"])
-            .set_index("DATE_TIME")
-        )
+    if power_columns:
+        power_data = selected.set_index("DATE_TIME")[
+            power_columns
+        ].dropna(how="all")
 
-        st.line_chart(power_data)
+        st.line_chart(power_data, height=350)
 
-        st.caption(
-            f"Showing {len(chart_df):,} readings "
-            f"from {start_date} to {end_date}."
-        )
-    else:
-        st.info("No generation readings for the selected dates.")
+    st.divider()
 
-# ============================================================
-# POTENTIAL ANOMALIES AND FILTERS
-# ============================================================
+    # --------------------------------------------------------
+    # ANOMALY ANALYSIS
+    # --------------------------------------------------------
 
-st.divider()
-st.subheader("Potential Anomalies")
+    st.subheader("Anomaly Analysis")
 
-flagged = display_df[
-    display_df["LOW_GENERATION_ANOMALY"]
-].copy()
-
-if flagged.empty:
-    st.success("No low-generation flags in the selected records.")
-else:
-    flagged["POWER_SHORTFALL"] = (
-        flagged["EXPECTED_MIN_AC_POWER"] - flagged["AC_POWER"]
-    ).clip(lower=0)
-
-    st.markdown("**Filter flagged readings**")
-
-    f1, f2, f3 = st.columns(3)
-
-    with f1:
-        max_irradiation = (
-            float(flagged["IRRADIATION"].max())
-            if flagged["IRRADIATION"].notna().any()
-            else 2.0
-        )
-
-        min_irradiation = st.number_input(
-            "Minimum irradiation",
-            min_value=0.0,
-            max_value=max(0.0, max_irradiation),
-            value=0.0,
-            step=0.05,
-        )
-
-    with f2:
-        min_shortfall = st.number_input(
-            "Minimum power shortfall",
-            min_value=0.0,
-            value=0.0,
-            step=100.0,
-        )
-
-    with f3:
-        valid_flag_dates = flagged["DATE_TIME"].dropna()
-
-        if not valid_flag_dates.empty:
-            anomaly_dates = st.date_input(
-                "Anomaly date range",
-                value=(
-                    valid_flag_dates.min().date(),
-                    valid_flag_dates.max().date(),
-                ),
-                min_value=valid_flag_dates.min().date(),
-                max_value=valid_flag_dates.max().date(),
-                key="anomaly_date_filter",
-            )
-        else:
-            anomaly_dates = ()
-
-    filtered = flagged[
-        (flagged["IRRADIATION"] >= min_irradiation)
-        & (flagged["POWER_SHORTFALL"] >= min_shortfall)
-    ].copy()
-
-    if isinstance(anomaly_dates, (tuple, list)):
-        if len(anomaly_dates) == 2:
-            start_date, end_date = anomaly_dates
-            filtered = filtered[
-                filtered["DATE_TIME"].dt.date.between(
-                    start_date,
-                    end_date,
-                )
-            ]
-        elif len(anomaly_dates) == 1:
-            filtered = filtered[
-                filtered["DATE_TIME"].dt.date == anomaly_dates[0]
-            ]
-
-    st.warning(
-        f"{len(filtered):,} of {len(flagged):,} flagged readings "
-        "match the selected filters."
+    anomaly_filter = st.selectbox(
+        "Filter readings",
+        [
+            "All readings",
+            "Low-generation anomalies",
+            "Zero-generation anomalies",
+            "Data quality issues",
+        ],
+        key=f"anomaly_filter_{record_view}",
     )
 
-    a1, a2, a3 = st.columns(3)
-
-    a1.metric("Matching Readings", f"{len(filtered):,}")
-    a2.metric(
-        "Average Power Shortfall",
-        f"{filtered['POWER_SHORTFALL'].mean():,.2f}"
-        if not filtered.empty else "N/A",
-    )
-    a3.metric(
-        "Maximum Power Shortfall",
-        f"{filtered['POWER_SHORTFALL'].max():,.2f}"
-        if not filtered.empty else "N/A",
-    )
-
-    anomaly_columns = [
-        column for column in [
-            "DATE_TIME",
-            "IRRADIATION",
-            "AC_POWER",
-            "EXPECTED_MIN_AC_POWER",
-            "POWER_SHORTFALL",
+    if anomaly_filter == "Low-generation anomalies":
+        table_data = selected[
+            selected["LOW_GENERATION_ANOMALY"]
         ]
-        if column in filtered.columns
+
+    elif anomaly_filter == "Zero-generation anomalies":
+        table_data = selected[
+            selected["ZERO_GENERATION_ANOMALY"]
+        ]
+
+    elif anomaly_filter == "Data quality issues":
+        table_data = selected[
+            selected["DATA_QUALITY_ISSUE"]
+        ]
+
+    else:
+        table_data = selected
+
+    st.caption(
+        f"Showing {len(table_data):,} matching readings"
+    )
+
+    preferred_columns = [
+        "DATE_TIME",
+        "INGESTION_TIME",
+        "AC_POWER",
+        "DC_POWER",
+        "IRRADIATION",
+        "AMBIENT_TEMPERATURE",
+        "MODULE_TEMPERATURE",
+        "EXPECTED_MIN_AC_POWER",
+        "LOW_GENERATION_ANOMALY",
+        "ZERO_GENERATION_ANOMALY",
+        "DATA_QUALITY_ISSUE",
+    ]
+
+    display_columns = [
+        column
+        for column in preferred_columns
+        if column in table_data.columns
     ]
 
     st.dataframe(
-        filtered[anomaly_columns].sort_values(
-            "DATE_TIME",
-            ascending=False,
-        ),
+        table_data[display_columns].tail(100).iloc[::-1],
         use_container_width=True,
         hide_index=True,
     )
 
+    # --------------------------------------------------------
+    # CSV EXPORT
+    # --------------------------------------------------------
+
     st.download_button(
-        "Download filtered anomalies (CSV)",
-        data=filtered[anomaly_columns].to_csv(index=False),
-        file_name="solar_anomalies.csv",
+        "Download filtered readings as CSV",
+        data=selected.to_csv(index=False).encode("utf-8"),
+        file_name="solar_readings.csv",
         mime="text/csv",
     )
 
-st.caption(
-    "Power shortfall is the difference between the selected historical "
-    "threshold and actual AC power. It is not measured lost energy. "
-    "Anomaly flags are exploratory indicators, not confirmed equipment faults."
-)
 
-# ============================================================
-# PROCESSED READINGS
-# ============================================================
-
-with st.expander("View processed readings"):
-    st.dataframe(
-        display_df.sort_values(
-            "DATE_TIME",
-            ascending=False,
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.divider()
-st.caption(
-    "Smart Solar Analytics | Kafka + Spark Structured Streaming + Streamlit"
-)
+render_dashboard(record_view)

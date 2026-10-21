@@ -9,6 +9,7 @@ from pyspark.sql.functions import (
     to_timestamp,
     when,
     lit,
+    current_timestamp,
 )
 from pyspark.sql.types import (
     StructType,
@@ -23,8 +24,8 @@ KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
 KAFKA_TOPIC = "solar-generation"
 
 THRESHOLD_FILE = Path("models/solar_anomaly_thresholds.json")
-OUTPUT_PATH = "data/processed/solar_readings"
-CHECKPOINT_PATH = "/tmp/smart-solar-spark-checkpoint-v4"
+OUTPUT_PATH = "data/processed/solar_readings_live"
+CHECKPOINT_PATH = "/tmp/smart-solar-spark-checkpoint-v6"
 
 # ---------------- LOAD THRESHOLDS ----------------
 
@@ -39,6 +40,7 @@ for sunlight_range, threshold in THRESHOLDS.items():
 
 schema = StructType([
     StructField("DATE_TIME", StringType(), True),
+    StructField("PLANT_ID", StringType(), True),
     StructField("AC_POWER", DoubleType(), True),
     StructField("DC_POWER", DoubleType(), True),
     StructField("DAILY_YIELD", DoubleType(), True),
@@ -79,6 +81,7 @@ parsed_stream = (
     .select("data.*")
     .filter(col("DATE_TIME").isNotNull())
     .withColumn("EVENT_TIME", to_timestamp(col("DATE_TIME")))
+    .withColumn("INGESTION_TIME", current_timestamp())
 )
 
 # ---------------- ANOMALY DETECTION ----------------
@@ -90,9 +93,10 @@ data_quality_issue = (
     | (col("IRRADIATION") < 0)
 )
 
-# Flag zero AC power when irradiation is strong.
+# Flag zero AC power only when meaningful irradiation is available.
 zero_generation_anomaly = (
-    (col("IRRADIATION") > 0.5)
+    col("IRRADIATION").isNotNull()
+    & (col("IRRADIATION") > 0.5)
     & (col("AC_POWER") == 0)
 )
 
@@ -124,9 +128,10 @@ generation_threshold = (
     )
 )
 
-# Flag potentially low generation during meaningful irradiation.
+# Only evaluate low generation when irradiation is available.
 low_generation_anomaly = (
-    (col("IRRADIATION") > 0.1)
+    col("IRRADIATION").isNotNull()
+    & (col("IRRADIATION") > 0.1)
     & (col("AC_POWER") < generation_threshold)
 )
 
@@ -149,7 +154,6 @@ processed_stream = (
         when(low_generation_anomaly, True).otherwise(False),
     )
 )
-
 # ---------------- PERSISTENT JSON OUTPUT ----------------
 
 Path(OUTPUT_PATH).mkdir(parents=True, exist_ok=True)

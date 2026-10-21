@@ -1,32 +1,31 @@
-
 import json
 import time
 import pandas as pd
 from kafka import KafkaProducer
 
-# Configuration
+# ---------------- CONFIGURATION ----------------
+
 DATA_DIR = "data/raw/Solar Power Generation/"
 TOPIC = "solar-generation"
 BOOTSTRAP_SERVERS = "localhost:9092"
 DELAY_SECONDS = 0.2
 
 
-def main():
-    print("Loading Plant 1 solar datasets...")
+def load_plant_data(plant_number):
+    print(f"Loading Plant {plant_number} datasets...")
 
-    # Load datasets
     generation = pd.read_csv(
-        DATA_DIR + "Plant_1_Generation_Data.csv"
-    )
-    weather = pd.read_csv(
-        DATA_DIR + "Plant_1_Weather_Sensor_Data.csv"
+        DATA_DIR + f"Plant_{plant_number}_Generation_Data.csv"
     )
 
-    # Normalize timestamps
+    weather = pd.read_csv(
+        DATA_DIR + f"Plant_{plant_number}_Weather_Sensor_Data.csv"
+    )
+
     generation["DATE_TIME"] = pd.to_datetime(
         generation["DATE_TIME"],
-        format="%d-%m-%Y %H:%M",
         errors="coerce",
+        dayfirst=False,
     )
 
     weather["DATE_TIME"] = pd.to_datetime(
@@ -34,13 +33,12 @@ def main():
         errors="coerce",
     )
 
-    # Remove invalid timestamps
     generation = generation.dropna(subset=["DATE_TIME"])
     weather = weather.dropna(subset=["DATE_TIME"])
 
-    # Aggregate inverter readings into plant-level metrics
+    # Aggregate inverter readings at each timestamp.
     plant_generation = (
-        generation.groupby("DATE_TIME", as_index=False)
+        generation.groupby(["PLANT_ID", "DATE_TIME"], as_index=False)
         .agg(
             DC_POWER=("DC_POWER", "sum"),
             AC_POWER=("AC_POWER", "sum"),
@@ -49,7 +47,7 @@ def main():
         )
     )
 
-    # Select weather features
+    # One weather reading per timestamp.
     weather_features = weather[
         [
             "DATE_TIME",
@@ -59,18 +57,30 @@ def main():
         ]
     ].drop_duplicates(subset=["DATE_TIME"])
 
-    # Merge generation and weather on timestamp
+    # Keep generation records even if weather data is unavailable.
     merged_data = pd.merge(
         plant_generation,
         weather_features,
         on="DATE_TIME",
-        how="inner",
-    )
+        how="left",
+    ).sort_values("DATE_TIME")
 
-    # Sort chronologically
-    merged_data = merged_data.sort_values("DATE_TIME")
+    print(f"Plant {plant_number}: {len(merged_data)} matched readings")
 
-    print(f"Matched readings: {len(merged_data)}")
+    return merged_data
+
+
+def main():
+    plant_1 = load_plant_data(1)
+    plant_2 = load_plant_data(2)
+
+    # Combine both plants and replay chronologically.
+    merged_data = pd.concat(
+        [plant_1, plant_2],
+        ignore_index=True,
+    ).sort_values("DATE_TIME")
+
+    print(f"Total readings per replay cycle: {len(merged_data)}")
     print("Connecting to Kafka...")
 
     producer = KafkaProducer(
@@ -81,30 +91,55 @@ def main():
     )
 
     sent_count = 0
+    cycle = 1
 
     try:
-        for _, row in merged_data.iterrows():
-            message = {
-                "DATE_TIME": row["DATE_TIME"].strftime("%Y-%m-%d %H:%M:%S"),
-                "DC_POWER": float(row["DC_POWER"]),
-                "AC_POWER": float(row["AC_POWER"]),
-                "DAILY_YIELD": float(row["DAILY_YIELD"]),
-                "TOTAL_YIELD": float(row["TOTAL_YIELD"]),
-                "AMBIENT_TEMPERATURE": float(row["AMBIENT_TEMPERATURE"]),
-                "MODULE_TEMPERATURE": float(row["MODULE_TEMPERATURE"]),
-                "IRRADIATION": float(row["IRRADIATION"]),
-            }
+        while True:
+            print(f"\nStarting replay cycle {cycle}...")
 
-            producer.send(TOPIC, value=message).get(timeout=30)
-            sent_count += 1
+            for _, row in merged_data.iterrows():
+                message = {
+                    "DATE_TIME": row["DATE_TIME"].strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    "PLANT_ID": str(row["PLANT_ID"]),
+                    "DC_POWER": float(row["DC_POWER"]),
+                    "AC_POWER": float(row["AC_POWER"]),
+                    "DAILY_YIELD": float(row["DAILY_YIELD"]),
+                    "TOTAL_YIELD": float(row["TOTAL_YIELD"]),
+                    "AMBIENT_TEMPERATURE": (
+                        float(row["AMBIENT_TEMPERATURE"])
+                        if pd.notna(row["AMBIENT_TEMPERATURE"])
+                        else None
+                    ),
+                    "MODULE_TEMPERATURE": (
+                        float(row["MODULE_TEMPERATURE"])
+                        if pd.notna(row["MODULE_TEMPERATURE"])
+                        else None
+                    ),
+                    "IRRADIATION": (
+                        float(row["IRRADIATION"])
+                        if pd.notna(row["IRRADIATION"])
+                        else None
+                    ),
+                }
 
-            if sent_count % 50 == 0:
-                print(f"Sent {sent_count} readings...")
+                producer.send(TOPIC, value=message).get(timeout=30)
+                sent_count += 1
 
-            time.sleep(DELAY_SECONDS)
+                if sent_count % 1000 == 0:
+                    print(
+                        f"Cycle {cycle}: sent {sent_count} total readings"
+                    )
 
-        producer.flush()
-        print(f"Streaming complete! Total readings sent: {sent_count}")
+                time.sleep(DELAY_SECONDS)
+
+            producer.flush()
+            print(f"Cycle {cycle} complete. Total sent: {sent_count}")
+            cycle += 1
+
+    except KeyboardInterrupt:
+        print(f"\nStopping producer. Total readings sent: {sent_count}")
 
     finally:
         producer.close()
